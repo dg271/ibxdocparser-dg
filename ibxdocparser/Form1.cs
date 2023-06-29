@@ -1,6 +1,6 @@
 using Microsoft.Web.WebView2.Core;
-using Microsoft.Web.WebView2.Core.DevToolsProtocolExtension;
 using Microsoft.Web.WebView2.WinForms;
+using System.Diagnostics;
 using System.Text.Json;
 
 namespace ibxdocparser
@@ -10,26 +10,26 @@ namespace ibxdocparser
     {
         private Queue<string> _profileUriQueue = new();
         private readonly IJsonParser<IbxProfile> _profileParser = new IbxProfileJsonParser();
-        private IbxProfileExcelSaver _saver = new();
-        private string _outputPath = "";
+
+        private readonly AccessDatabase _database;
+        private readonly IProfileSaver<IbxProfile> _ibxSaver;
+        private readonly IProfileSaver<LvhnProfile> _lvhnSaver;
 
         public frmIbxDocParser()
         {
             InitializeComponent();
+            _database = new("Data.accdb");
+            _ibxSaver = new IbxDatabaseSaver(_database);
+            _lvhnSaver = new LvhnDatabaseSaver(_database);
         }
 
         private async void Form1_Load(object sender, EventArgs e)
         {
+            await _database.InitializeAsync();
             await InitializeWebView();
             NavigateWebViewToSearchHome();
 
-            webView.CoreWebView2.GetDevToolsProtocolHelper().Console.MessageAdded += Console_MessageAdded;
-            webView.CoreWebView2.OpenDevToolsWindow();
-        }
-
-        private void Console_MessageAdded(object? sender, Microsoft.Web.WebView2.Core.DevToolsProtocolExtension.Console.MessageAddedEventArgs e)
-        {
-            System.Diagnostics.Debug.WriteLine(e.Message);
+            //webView.CoreWebView2.OpenDevToolsWindow();
         }
 
         private async Task InitializeWebView()
@@ -49,7 +49,7 @@ namespace ibxdocparser
         /// <param name="sender"></param>
         /// <param name="e"></param>
         /// <exception cref="MissingFieldException"></exception>
-        private void CoreWebView2_WebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+        private async void CoreWebView2_WebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
         {
             string json = e.WebMessageAsJson;
 
@@ -67,7 +67,7 @@ namespace ibxdocparser
                     _profileUriQueue = new Queue<string>(allLinks);
 
                     // Initiate the first profile after receiving the list of profile links
-                    AdvanceProfileOrSaveParsedProfiles();
+                    await AdvanceProfileOrSaveParsedProfilesAsync();
                     break;
             }
         }
@@ -95,15 +95,16 @@ namespace ibxdocparser
                 {
                     string profileJson = await GetResponseContentAsync(e.Response);
                     IbxProfile profile = _profileParser.Parse(profileJson);
-                    await _saver.WriteProfileAsync(profile);
+                    await _ibxSaver.AddProfileAsync(profile);
 
                     ProfileProcessed((string)(webView.Tag ?? ""));
-                    AdvanceProfileOrSaveParsedProfiles();
+                    await AdvanceProfileOrSaveParsedProfilesAsync();
                 }
             }
             catch (Exception exc)
             {
-                System.Diagnostics.Debug.WriteLine(exc.ToString());
+                Debug.WriteLine(exc.ToString());
+                throw;
             }
         }
 
@@ -141,7 +142,7 @@ namespace ibxdocparser
         /// <summary>
         /// Either go to the next profile Uri if any exist or save the results of all completed ones.
         /// </summary>
-        private void AdvanceProfileOrSaveParsedProfiles()
+        private async Task AdvanceProfileOrSaveParsedProfilesAsync()
         {
             if (_profileUriQueue.Any())
             {
@@ -149,27 +150,8 @@ namespace ibxdocparser
             }
             else
             {
-                // Retry saving in case there's an error like the file is already open.
-                do
-                {
-                    try
-                    {
-                        _saver.Save(_outputPath);
-                        MessageBox.Show("Complete");
-                        break;
-                    }
-                    catch (Exception exc)
-                    {
-                        if (DialogResult.Cancel == MessageBox.Show(
-                            exc.ToString(),
-                            "Error",
-                            MessageBoxButtons.RetryCancel,
-                            MessageBoxIcon.Error))
-                        {
-                            break;
-                        }
-                    }
-                } while (true);
+                await _ibxSaver.SaveAsync();
+                MessageBox.Show("done");
             }
         }
 
@@ -202,9 +184,7 @@ namespace ibxdocparser
 
         private async void btnParseListings_Click(object sender, EventArgs e)
         {
-            var fileResult = saveFileDialog1.ShowDialog(this);
-            if (fileResult != DialogResult.OK) return;
-            _outputPath = saveFileDialog1.FileName;
+            await _ibxSaver.StartSessionAsync("Ibx Profile Search", webView.Source);
             var scriptPath = Path.Combine(Environment.CurrentDirectory, "Javascript", "GetIbxDocProfilesFromListing.js");
             string script = File.ReadAllText(scriptPath);
             await webView.CoreWebView2.ExecuteScriptAsync(script);
@@ -236,6 +216,82 @@ namespace ibxdocparser
 
             string script = File.ReadAllText(@"Javascript\Test.js");
             await webView.CoreWebView2.ExecuteScriptAsync(script);
+        }
+
+        private async void btnParseLvhn_Click(object sender, EventArgs e)
+        {
+            string url = Microsoft.VisualBasic.Interaction.InputBox(
+                "Enter the URL to search from https://www.lvhn.org/doctors",
+                "Search Listing Page URL",
+                DefaultResponse: "https://www.lvhn.org/doctors?keys=Internal%20Medicine&f%5B0%5D=patient_age%3AUnder%2016&f%5B1%5D=specialty%3A2118");
+
+            if (string.IsNullOrEmpty(url))
+            {
+                return;
+            }
+
+            await _lvhnSaver.StartSessionAsync("LVHN Profile Search", new Uri(url));
+
+            List<LvhnProfile> profiles = await LvhnOrgHtmlParser.ParseFullResultsAsync(new Uri(url));
+
+            for (var i = 0; i < profiles.Count; i++)
+            {
+                var profile = profiles[i];
+                Debug.WriteLine($"Parsing profile {i + 1}/{profiles.Count} ({profile.Summary?.Name})");
+                try
+                {
+                    await _lvhnSaver.AddProfileAsync(profile);
+                }
+                catch (Exception)
+                {
+                    Debug.WriteLine($"Failed to save profile for {profile.Summary?.Name}");
+                    throw;
+                }
+            }
+
+            await _lvhnSaver.SaveAsync();
+            MessageBox.Show("Done");
+        }
+
+        private string? SaveExcelFile(Action<string> save)
+        {
+            while (true)
+            {
+                if (DialogResult.Cancel == saveExcelFileDialog.ShowDialog())
+                {
+                    return null;
+                }
+
+                try
+                {
+                    save(saveExcelFileDialog.FileName);
+                    MessageBox.Show($"File saved successfully at: {saveExcelFileDialog.FileName}");
+                    return saveExcelFileDialog.FileName;
+                }
+                catch (Exception ex)
+                {
+                    if (DialogResult.Cancel == MessageBox.Show(ex.Message, "Error", MessageBoxButtons.RetryCancel, MessageBoxIcon.Error))
+                    {
+                        return null;
+                    }
+                }
+
+            };
+        }
+
+        private async void btnClearDatabase_Click(object sender, EventArgs e)
+        {
+            var response = MessageBox.Show(
+                "Are you sure you want to delete the database file?",
+                "Confirm",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Exclamation);
+
+            if (DialogResult.OK == response)
+            {
+                await _database.ResetAsync();
+                MessageBox.Show("The database was deleted", "Success");
+            }
         }
     }
 
